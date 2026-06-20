@@ -1,0 +1,522 @@
+# ============================================================================
+# RoboTwin "锤子敲方块" (beat_block_hammer) 任务 — ACT 策略 纯评估配置
+# ============================================================================
+# 本配置文件用于对 ACT (Action Chunking Transformer) 策略进行离线评估，
+# 不执行任何训练更新（only_eval: True）。
+# 机器人平台: ALOHA-AgileX 双臂机器人
+# 使用算法: GRPO (Group Relative Policy Optimization) + Actor-only loss
+# 分布式策略: FSDP (Fully Sharded Data Parallel) — 单机单卡
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Hydra 配置组合 — 将多个子配置文件组装成完整配置
+# ---------------------------------------------------------------------------
+defaults:
+  # 训练环境子配置，注入到 env.train 节点下
+  - env/robotwin_beat_block_hammer@env.train
+  # 评估环境子配置，注入到 env.eval 节点下
+  - env/robotwin_beat_block_hammer@env.eval
+  # ACT 模型子配置，注入到 actor.model 节点下
+  - model/act@actor.model
+  # FSDP 分布式训练后端子配置，注入到 actor.fsdp_config 节点下
+  - training_backend/fsdp@actor.fsdp_config
+  # 权重同步器子配置（patch_syncer: 增量同步方式，只传输参数差异）
+  - weight_syncer/patch_syncer@weight_syncer
+  # _self_ 表示当前文件中的配置优先级最高，会覆盖 defaults 中的同名参数
+  - _self_
+  # 覆盖 Hydra 默认的日志输出方式，改为直接输出到标准输出（stdout）
+  - override hydra/job_logging: stdout
+
+# ---------------------------------------------------------------------------
+# Hydra 框架运行设置
+# ---------------------------------------------------------------------------
+hydra:
+  run:
+    # 运行目录设为当前目录 "."，日志和输出直接写在当前路径下
+    dir: .
+  # 不创建 .hydra 子目录（通常用于存放 Hydra 内部元数据）
+  output_subdir: null
+  # 额外的配置搜索路径，从环境变量 EMBODIED_PATH 指向的 config/ 目录加载子配置
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# ---------------------------------------------------------------------------
+# 集群/分布式部署配置
+# ---------------------------------------------------------------------------
+cluster:
+  # 使用 1 个计算节点（单机运行）
+  num_nodes: 1
+  # 组件放置策略：将 actor（训练）、env（环境）、rollout（推演）全部放在节点 0
+  # 这是单节点全组件共置（collocated）模式
+  component_placement:
+    actor, env, rollout: 0
+
+# ---------------------------------------------------------------------------
+# Runner 运行器配置 — 控制训练/评估的主循环逻辑
+# ---------------------------------------------------------------------------
+runner:
+  # 任务类型: embodied（具身智能任务，操作机器人物理环境）
+  task_type: embodied
+  # 日志记录器配置
+  logger:
+    # 日志/结果输出根目录（相对于项目根目录的上级目录）
+    log_path: "../results"
+    # W&B/TensorBoard 等项目名称
+    project_name: rlinf
+    # 本次实验的名称，用于区分不同的运行
+    experiment_name: "robotwin_beat_block_hammer_act_eval"
+    # 日志后端: 使用 TensorBoard 记录标量/图像等指标
+    logger_backends: ["tensorboard"]
+
+  # 最大训练 epoch 数，设为 1（评估只跑一轮）
+  max_epochs: 1
+  # 最大训练步数，-1 表示不限制（配合 max_epochs 使用）
+  max_steps: -1
+  # 🔑 关键开关：True 表示仅执行评估，完全跳过训练循环
+  only_eval: True
+  # 每隔多少个 epoch 做一次验证/评估
+  val_check_interval: 1
+  # 模型保存间隔（按 global_step），-1 表示不保存 checkpoint
+  save_interval: -1
+  # 训练恢复目录，null 表示不恢复训练（从头开始）
+  resume_dir: null
+  # 模型权重加载路径，null 表示需要在命令行通过 +ckpt_path=xxx 指定
+  ckpt_path: null
+
+# ---------------------------------------------------------------------------
+# 强化学习算法配置
+# ---------------------------------------------------------------------------
+algorithm:
+  # 是否对优势函数 (advantages) 做归一化（减均值除以标准差）
+  normalize_advantages: True
+  # KL 散度惩罚类型: "kl" 表示使用 KL 散度约束策略更新幅度
+  kl_penalty: kl
+  # 环境分组大小（每组的并行环境数），1 表示不分组
+  group_size: 1
+  # 每次 rollout 收集数据的 epoch 数
+  rollout_epoch: 1
+  # 每次评估 rollout 的 epoch 数
+  eval_rollout_epoch: 1
+  # 奖励计算粒度: action_level（每个动作步都计算奖励）
+  reward_type: action_level
+  # 对数概率计算粒度: action_level（每个动作步独立计算 logprob）
+  logprob_type: action_level
+  # 熵计算粒度: action_level
+  entropy_type: action_level
+  # 🔑 优势估计类型: GRPO (Group Relative Policy Optimization)
+  # GRPO 通过组内相对比较来估计优势，无需 Critic 网络
+  adv_type: grpo
+  # 🔑 损失函数类型: actor（仅使用 Actor 损失，无 Critic/Value 损失）
+  # 与 adv_type=grpo 配套使用，构成纯 Actor 优化
+  loss_type: actor
+  # 损失聚合方式: "token-mean" — 按 token 维度取平均（而非按样本平均）
+  loss_agg_func: "token-mean"
+  # Bootstrap 类型: "always" — 始终对 episode 终态做 bootstrap 值估计
+  bootstrap_type: always
+  # KL 散度惩罚系数，0.0 表示实际不施加 KL 约束
+  kl_beta: 0.0
+  # 熵奖励系数，0 表示不添加熵奖励（策略不做熵正则化）
+  entropy_bonus: 0
+  # PPO 风格裁剪比率上限（用于策略损失裁剪）
+  clip_ratio_high: 0.2
+  # PPO 风格裁剪比率下限
+  clip_ratio_low: 0.2
+  # 双重裁剪 (dual-clip) 的上界系数 C
+  clip_ratio_c: 3.0
+  # 折扣因子 γ：未来奖励的衰减系数，0.99 表示较远期的奖励也重要
+  gamma: 0.99
+  # GAE (Generalized Advantage Estimation) 的 λ 参数，控制偏差-方差权衡
+  gae_lambda: 0.95
+
+  # --- 动作采样式/解码参数 ---
+  sampling_params:
+    # 是否采样：False 表示使用贪心解码（确定性推理），评估时通常关闭采样
+    do_sample: False
+    # 训练时的温度参数：1.0 表示不做温度缩放
+    temperature_train: 1.0
+    # 评估时的温度参数：-1 表示使用默认行为（通常不缩放或跟随训练设置）
+    temperature_eval: -1
+    # Top-K 采样：-1 表示不限制（考虑所有 token）
+    top_k: -1
+    # Top-P (nucleus) 采样：1.0 表示累积概率达到 100%，即不做过滤
+    top_p: 1.0
+    # 重复惩罚系数：1.0 表示不惩罚重复
+    repetition_penalty: 1.0
+
+  # --- 生成序列长度参数 ---
+  length_params:
+    # 最大新增 token 数，null 表示不限制（由 max_length 控制）
+    max_new_token: null
+    # 最大总序列长度（token 数），1024 是 ACT 生成动作序列的常用长度
+    max_length: 1024
+    # 最小生成长度，1 表示至少生成 1 个 token
+    min_length: 1
+
+# ---------------------------------------------------------------------------
+# 环境配置
+# ---------------------------------------------------------------------------
+env:
+  # 环境 Worker 组的名称
+  group_name: "EnvGroup"
+
+  # ======================== 训练环境 ========================
+  train:
+    # 训练环境并行总数（单个进程内的环境实例数）
+    total_num_envs: 1
+    # episode 结束后是否自动 reset 环境
+    auto_reset: True
+    # 是否忽略环境的终止信号（termination），True 表示即使环境发出 done 也不停止
+    ignore_terminations: True
+    # 是否对观测图像做中心裁剪
+    center_crop: False
+    # 环境分组大小，1 表示不分组
+    group_size: 1
+    # 训练环境的随机种子
+    seed: 42
+    # 是否使用固定的 reset 状态 ID（用于可复现评估），训练时关闭
+    use_fixed_reset_state_ids: False
+    # 每个 episode 的最大步数，超过后强制截断
+    max_episode_steps: 400
+    # 每次 rollout epoch 的最大步数上限
+    max_steps_per_rollout_epoch: 400
+    # RoboTwin 资产文件路径（包含机器人模型、场景等）
+    assets_path: "/home/lhj/RoboTwin-RLinf_support"
+    # 训练种子文件路径（用于初始化不同的 episode 起始状态）
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/train_seeds.json
+    # 是否启用模型/数据 offload 到 CPU 以节省 GPU 显存
+    enable_offload: False
+    # 训练时使用 RoboTwin 任务内置 dense reward: Pick -> Place -> Success
+    step_mode: gen_dense_reward_once
+    # 不再用 termination 覆盖环境 reward，否则 dense reward 会退化成 sparse success reward
+    use_custom_reward: False
+    # 视频录制配置
+    video_cfg:
+      # 训练时不保存视频
+      save_video: False
+      # 是否在视频画面上叠加信息文字（如 reward、step 等）
+      info_on_video: True
+      # 训练视频保存目录
+      video_base_dir: ${runner.logger.log_path}/video/train
+    # RoboTwin 任务详细参数
+    task_config:
+      # 任务名称: beat_block_hammer（控制双臂用锤子敲击方块）
+      task_name: beat_block_hammer
+      # 每个 episode 的步数限制
+      step_lim: 400
+      # 运动规划后端: mplib（使用 Motion Planning Library）
+      planner_backend: mplib
+      # 渲染频率: 0 表示不渲染 GUI（仅做物理计算，加速数据采集）
+      render_freq: 0
+      # 评估 episode 数量
+      episode_num: 100
+      # 是否使用固定种子
+      use_seed: false
+      # 数据保存频率（每隔多少步保存一次）
+      save_freq: 15
+      # 机器人物理形态: aloha-agilex（ALOHA 双臂机器人，AgileX 底盘）
+      embodiment: [aloha-agilex]
+      # 是否使用双臂模式
+      dual_arm: true
+      # 语言指令数量（生成多少条不同的自然语言指令变体）
+      language_num: 100
+      # 数据保存路径
+      save_path: ./data
+      # 缓存清理频率（每隔多少个 episode 清理一次缓存）
+      clear_cache_freq: 5
+      # 是否收集新数据（评估时为 false，使用已有数据）
+      collect_data: false
+      # 是否记录评估视频日志
+      eval_video_log: false
+      # --- 域随机化 (Domain Randomization) ---
+      # 评估时全部关闭，确保测试环境的确定性和可复现性
+      domain_randomization:
+        # 是否随机化背景纹理
+        random_background: false
+        # 是否在桌面上随机放置杂物
+        cluttered_table: false
+        # 干净背景（无随机化）的出现概率，1.0 = 100%
+        clean_background_rate: 1.0
+        # 头部相机距离的随机偏移量，0 表示固定距离
+        random_head_camera_dis: 0
+        # 桌面高度的随机偏移量，0 表示固定高度
+        random_table_height: 0
+        # 是否随机化光照条件
+        random_light: false
+        # 极端随机光照的出现概率，0 表示不发生
+        crazy_random_light_rate: 0
+      # 相机配置
+      camera:
+        # 头部相机型号: D435（Intel RealSense Depth Camera D435）
+        head_camera_type: D435
+        # 腕部相机型号: D435
+        wrist_camera_type: D435
+        # 是否采集头部相机数据
+        collect_head_camera: true
+        # 是否采集腕部相机数据
+        collect_wrist_camera: true
+      # 数据类型配置（控制采集哪些模态的数据）
+      data_type:
+        # RGB 彩色图像
+        rgb: true
+        # 第三视角相机
+        third_view: false
+        # 观察者视角
+        observer: false
+        # 深度图像
+        depth: false
+        # 点云数据
+        pointcloud: false
+        # 末端执行器位姿（位置 + 姿态，6D）
+        endpose: true
+        # 关节位置（joint positions）
+        qpos: true
+        # 网格语义分割
+        mesh_segmentation: false
+        # Actor 语义分割
+        actor_segmentation: false
+      # 点云下采样点数（当 data_type.pointcloud=true 时生效）
+      pcd_down_sample_num: 1024
+      # 是否对点云做裁剪
+      pcd_crop: true
+
+  # ======================== 评估环境 ========================
+  eval:
+    # 评估环境并行总数
+    total_num_envs: 1
+    # episode 结束后自动 reset
+    auto_reset: True
+    # 忽略环境终止信号
+    ignore_terminations: True
+    # 不做中心裁剪
+    center_crop: False
+    # 环境分组大小
+    group_size: 1
+    # 评估环境的随机种子（与训练不同，避免数据泄露）
+    seed: 1000
+    # 🔑 使用固定的 reset 状态 ID，确保每次评估的初始状态完全一致，保证可复现性
+    use_fixed_reset_state_ids: True
+    # 每个 episode 的最大步数
+    max_episode_steps: 400
+    # 每次 rollout epoch 的最大步数
+    max_steps_per_rollout_epoch: 400
+    # 资产文件路径（与训练相同）
+    assets_path: "/home/lhj/RoboTwin-RLinf_support"
+    # 评估种子文件路径（与训练使用不同的种子文件）
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
+    # GPU offload 开关
+    enable_offload: False
+    # 🔑 环境步进模式: "take_action" — 直接执行策略输出的动作（评估模式）
+    # 与训练的 "gen_sparse_reward_data" 不同，评估时不生成奖励数据
+    step_mode: take_action
+    # 视频录制配置
+    video_cfg:
+      # 评估时不保存视频
+      save_video: False
+      # 在视频画面上叠加信息
+      info_on_video: True
+      # 评估视频保存目录
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    # 任务参数（与训练环境保持一致）
+    task_config:
+      task_name: beat_block_hammer
+      step_lim: 400
+      planner_backend: mplib
+      render_freq: 0
+      episode_num: 100
+      use_seed: false
+      save_freq: 15
+      embodiment: [aloha-agilex]
+      dual_arm: true
+      language_num: 100
+      save_path: ./data
+      clear_cache_freq: 5
+      collect_data: false
+      eval_video_log: false
+      # 域随机化 — 评估时全部关闭
+      domain_randomization:
+        random_background: false
+        cluttered_table: false
+        clean_background_rate: 1.0
+        random_head_camera_dis: 0
+        random_table_height: 0
+        random_light: false
+        crazy_random_light_rate: 0
+      # 相机配置
+      camera:
+        head_camera_type: D435
+        wrist_camera_type: D435
+        collect_head_camera: true
+        collect_wrist_camera: true
+      # 数据类型
+      data_type:
+        rgb: true
+        third_view: false
+        observer: false
+        depth: false
+        pointcloud: false
+        endpose: true
+        qpos: true
+        mesh_segmentation: false
+        actor_segmentation: false
+      pcd_down_sample_num: 1024
+      pcd_crop: true
+
+# ---------------------------------------------------------------------------
+# Rollout 推演 Worker 配置 — 负责用当前策略在环境中收集交互数据
+# ---------------------------------------------------------------------------
+rollout:
+  # Rollout Worker 组的名称
+  group_name: "RolloutGroup"
+  # 模型后端: "huggingface" — 使用 HuggingFace Transformers 加载和推理模型
+  backend: "huggingface"
+  # 是否启用模型 offload 到 CPU，节省 GPU 显存（推理完一层就卸载）
+  enable_offload: True
+  # Pipeline 微批次并行阶段数，1 表示不拆分流水线
+  pipeline_stage_num: 1
+  # --- 模型参数（全部通过 ${actor.model.xxx} 引用 actor 模型配置）---
+  # 这样做确保 rollout 推理和 actor 训练使用完全相同的模型结构和参数
+  model:
+    # 模型类型（如 act），引用 actor 配置
+    model_type: ${actor.model.model_type}
+    # 模型权重文件路径
+    model_path: ${actor.model.model_path}
+    # 数据集统计信息路径（用于输入归一化）
+    dataset_stats_path: ${actor.model.dataset_stats_path}
+    # ACT 源码目录
+    act_source_dir: ${actor.model.act_source_dir}
+    # 策略配置（实例化参数）
+    policy_setup: ${actor.model.policy_setup}
+    # 使用的相机名称列表
+    camera_names: ${actor.model.camera_names}
+    # 状态空间维度（关节位置 + 末端位姿等）
+    state_dim: ${actor.model.state_dim}
+    # 动作空间维度（关节角度或末端位移）
+    action_dim: ${actor.model.action_dim}
+    # 动作分块数量（ACT 核心参数：一次生成多少个连续动作块）
+    num_action_chunks: ${actor.model.num_action_chunks}
+    # 每个动作块的大小（时间步数）
+    chunk_size: ${actor.model.chunk_size}
+    # KL 散度权重（用于 VAE 风格的动作编码器正则化）
+    kl_weight: ${actor.model.kl_weight}
+    # Transformer 隐藏层维度
+    hidden_dim: ${actor.model.hidden_dim}
+    # 前馈网络维度
+    dim_feedforward: ${actor.model.dim_feedforward}
+    # 学习率（评估时不更新，但模型结构需一致）
+    lr: ${actor.model.lr}
+    # 视觉骨干网络的学习率
+    lr_backbone: ${actor.model.lr_backbone}
+    # 权重衰减（L2 正则化系数）
+    weight_decay: ${actor.model.weight_decay}
+    # 视觉骨干网络架构（如 ResNet-18）
+    backbone: ${actor.model.backbone}
+    # Transformer 编码器层数
+    enc_layers: ${actor.model.enc_layers}
+    # Transformer 解码器层数
+    dec_layers: ${actor.model.dec_layers}
+    # 多头注意力头数
+    nheads: ${actor.model.nheads}
+    # 位置编码方式（如 sinusoidal、learned）
+    position_embedding: ${actor.model.position_embedding}
+    # Dropout 比率
+    dropout: ${actor.model.dropout}
+    # 是否使用 Pre-Norm（LayerNorm 在 Attention/FFN 之前）
+    pre_norm: ${actor.model.pre_norm}
+    # 是否使用注意力掩码（用于自回归生成时遮蔽未来信息）
+    masks: ${actor.model.masks}
+    # 卷积膨胀率（仅当使用 CNN 编码时相关）
+    dilation: ${actor.model.dilation}
+    # 数值精度（如 float32, bfloat16, float16）
+    precision: ${actor.model.precision}
+    # 是否在初始化时将模型加载到 GPU
+    load_to_device: ${actor.model.load_to_device}
+    # 是否为模型添加 Value Head（用于 Actor-Critic 算法）
+    add_value_head: ${actor.model.add_value_head}
+    # 是否使用 LoRA（Low-Rank Adaptation）微调
+    is_lora: ${actor.model.is_lora}
+    # LoRA 秩（低秩矩阵的秩，控制可训练参数量）
+    lora_rank: ${actor.model.lora_rank}
+    # 图像归一化方式
+    image_normalization: ${actor.model.image_normalization}
+    # 图像缩放的目标高宽
+    image_resize_hw: ${actor.model.image_resize_hw}
+    # 评估时是否逐步输出（vs 一次性输出整个 chunk）
+    eval_stepwise: ${actor.model.eval_stepwise}
+    # 🔑 是否使用时间聚合 (Temporal Aggregation) — ACT 的关键推理技巧
+    # 通过指数加权平均平滑连续时间步的动作预测，减少抖动
+    temporal_agg: ${actor.model.temporal_agg}
+    # 时间聚合的衰减系数（越接近 1 表示越重视历史预测）
+    temporal_agg_decay: ${actor.model.temporal_agg_decay}
+    # 动作初始对数标准差（用于随机策略，如 SAC 风格）
+    initial_logstd: ${actor.model.initial_logstd}
+    # 动作对数标准差的下界
+    min_logstd: ${actor.model.min_logstd}
+    # 动作对数标准差的上界
+    max_logstd: ${actor.model.max_logstd}
+    # 评估时是否使用随机策略（vs 确定性策略）
+    use_stochastic_eval: ${actor.model.use_stochastic_eval}
+
+# ---------------------------------------------------------------------------
+# Actor 训练 Worker 配置 — 负责策略网络的参数更新
+# ---------------------------------------------------------------------------
+actor:
+  # Actor Worker 组的名称
+  group_name: "ActorGroup"
+  # 🔑 分布式训练后端: FSDP (Fully Sharded Data Parallel)
+  # 将模型参数、梯度、优化器状态分片到多个 GPU，节省显存
+  training_backend: "fsdp"
+  # 每个 GPU 单次前向的微批次大小（用于梯度累积）
+  micro_batch_size: 1
+  # 全局批次大小（跨所有 GPU 和梯度累积步数），1 表示评估时只处理单个样本
+  global_batch_size: 1
+  # Actor 的随机种子
+  seed: 1234
+  # 启用模型 offload 到 CPU（进一步节省显存）
+  enable_offload: True
+
+  # --- 优化器配置 ---
+  optim:
+    # 学习率: 1e-6（评估模式下学习率极低，几乎不更新参数）
+    lr: 1.0e-6
+    # Adam 优化器 β1 参数（一阶动量系数）
+    adam_beta1: 0.9
+    # Adam 优化器 β2 参数（二阶动量系数）
+    adam_beta2: 0.999
+    # Adam 优化器 ε 参数（数值稳定性常数）
+    adam_eps: 1.0e-08
+    # 权重衰减系数，0.0 表示不使用 L2 正则化
+    weight_decay: 0.0
+    # 梯度裁剪的最大范数，1.0 表示将梯度范数限制在 1.0 以内
+    clip_grad: 1.0
+    # Critic 热身步数（在开始训练 Actor 前先训练 Critic 多少步），0 表示不热身
+    critic_warmup_steps: 0
+
+  # --- FSDP 详细配置 ---
+  fsdp_config:
+    # FSDP 策略: "fsdp"（标准 FSDP 模式，另有 "fsdp2" 等）
+    strategy: "fsdp"
+    # 是否启用梯度检查点（以计算换显存），评估模式下关闭
+    gradient_checkpointing: False
+    # 混合精度训练配置
+    mixed_precision:
+      # 模型参数的数据类型（如 bf16, fp16, fp32）
+      param_dtype: ${actor.model.precision}
+      # 梯度规约时的数据类型
+      reduce_dtype: ${actor.model.precision}
+      # 计算缓冲区（如归一化层中间结果）的数据类型
+      buffer_dtype: ${actor.model.precision}
+
+# ---------------------------------------------------------------------------
+# 奖励模型配置
+# ---------------------------------------------------------------------------
+reward:
+  # 是否使用独立的奖励模型（如 learned reward model），False 表示使用环境内置奖励
+  use_reward_model: False
+
+# ---------------------------------------------------------------------------
+# Critic 模型配置
+# ---------------------------------------------------------------------------
+critic:
+  # 是否使用 Critic/Value 网络，False 表示纯 Actor 模式
+  # 与 adv_type=grpo + loss_type=actor 配套，GRPO 通过组内相对比较无需 Critic
+  use_critic_model: False

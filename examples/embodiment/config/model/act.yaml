@@ -1,0 +1,42 @@
+model_type: "act"
+model_path: "/home/lhj/robot_l/robotwin/policy/ACT/act_ckpt/act-beat_block_hammer/demo_clean-50/policy_last.ckpt"
+dataset_stats_path: "/home/lhj/robot_l/robotwin/policy/ACT/act_ckpt/act-beat_block_hammer/demo_clean-50/dataset_stats.pkl"
+act_source_dir: "/home/lhj/robot_l/robotwin/policy/ACT"
+
+policy_setup: "aloha-qpos"
+camera_names: ["cam_high", "cam_left_wrist", "cam_right_wrist"]
+state_dim: 14
+action_dim: 14
+num_action_chunks: 50
+chunk_size: 50
+
+kl_weight: 10.0
+hidden_dim: 512
+dim_feedforward: 3200
+lr: 1e-5
+lr_backbone: 1e-5
+weight_decay: 1e-4
+backbone: "resnet18"
+enc_layers: 4
+dec_layers: 7
+nheads: 8
+position_embedding: "sine"
+dropout: 0.1
+pre_norm: false
+masks: false
+dilation: false
+
+precision: "32"
+load_to_device: true
+add_value_head: false
+is_lora: false
+lora_rank: 32
+image_normalization: "imagenet"
+image_resize_hw: [480, 640]
+eval_stepwise: true
+temporal_agg: true
+temporal_agg_decay: 0.01
+initial_logstd: -2.0
+min_logstd: -5.0
+max_logstd: 1.0
+use_stochastic_eval: false
