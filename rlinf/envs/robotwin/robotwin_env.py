@@ -53,9 +53,17 @@ class RoboTwinEnv(gym.Env):
         self.step_mode = cfg.get("step_mode", "gen_sparse_reward_data")
 
         self.group_size = cfg.group_size
+        if self.group_size <= 0 or self.num_envs % self.group_size != 0:
+            raise ValueError(
+                "RoboTwinEnv requires num_envs to be divisible by group_size, "
+                f"got num_envs={self.num_envs}, group_size={self.group_size}."
+            )
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.use_custom_reward = cfg.use_custom_reward
+        self.check_group_reset_state_ids = bool(
+            cfg.get("check_group_reset_state_ids", False)
+        )
 
         self.video_cfg = cfg.video_cfg
 
@@ -637,6 +645,19 @@ class RoboTwinEnv(gym.Env):
                     repeats=self.group_size
                 )
             self.reset_state_ids = reset_state_ids
+        self._assert_group_reset_state_ids()
+
+    def _assert_group_reset_state_ids(self):
+        if not self.check_group_reset_state_ids or self.group_size <= 1:
+            return
+        grouped = self.reset_state_ids.reshape(self.num_group, self.group_size)
+        mismatched = grouped.ne(grouped[:, :1]).any(dim=1)
+        if mismatched.any():
+            bad_group = int(torch.nonzero(mismatched, as_tuple=False)[0].item())
+            raise ValueError(
+                "GRPO group reset_state_id mismatch: group "
+                f"{bad_group} has ids {grouped[bad_group].tolist()}."
+            )
 
     def check_seeds(self, seeds):
         resutls = self.venv.check_seeds(seeds)

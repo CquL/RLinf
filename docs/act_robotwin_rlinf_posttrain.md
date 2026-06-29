@@ -384,3 +384,270 @@ env:
 
 Keep eval clean and randomized as two separate configs so success-rate movement
 is easy to interpret.
+
+## 6. Conservative ACT Fine-Tuning After Full-GRPO Regression
+
+Current measured RLinf-side comparison:
+
+| Policy | Eval budget | `eval/success_once` | Note |
+| --- | ---: | ---: | --- |
+| clean ACT baseline (`runner.ckpt_path=null`) | 100 trajectories | 0.60 | Uses `demo_clean-50/policy_last.ckpt` |
+| dense GRPO `global_step_10` | 100 trajectories | 0.40 | Full ACT policy was trainable |
+
+This means the clean ACT checkpoint is useful, but the first dense-reward GRPO
+run perturbed the imitation policy too much. The next route should be
+conservative RL fine-tuning, not more full-model GRPO.
+
+The conservative config is:
+
+```text
+examples/embodiment/config/robotwin_beat_block_hammer_grpo_act_conservative.yaml
+```
+
+It changes the training scope to:
+
+```yaml
+actor:
+  fsdp_config:
+    use_orig_params: true
+  model:
+    trainable_scope: action_head_logstd
+    initial_logstd: -3.0
+    min_logstd: -5.0
+    max_logstd: -2.0
+```
+
+With this scope, RLinf freezes the ACT body and trains only:
+
+- `logstd`
+- `act_model.action_head.weight`
+- `act_model.action_head.bias`
+
+The expected startup log should include only those trainable names:
+
+```text
+ACT trainable_scope=action_head_logstd: ...
+[Trainable] logstd
+[Trainable] act_model.action_head.weight
+[Trainable] act_model.action_head.bias
+```
+
+`use_orig_params: true` is required for this partial-freeze setup. With
+`use_orig_params: false`, FSDP tries to flatten trainable and frozen parameters
+together and raises `ValueError: Must flatten tensors with uniform
+requires_grad`.
+
+The config also enables a GRPO group seed consistency check:
+
+```yaml
+env:
+  train:
+    group_size: 2
+    check_group_reset_state_ids: true
+```
+
+This fails fast if trajectories in the same GRPO group do not share the same
+`reset_state_id`. Group-relative rewards should compare policy samples under
+the same initial condition, not different task difficulty.
+
+Smoke command:
+
+```bash
+source /home/lhj/anaconda3/etc/profile.d/conda.sh
+conda activate RoboTwin
+cd /home/lhj/RLinf-main
+
+export REPO_PATH=/home/lhj/RLinf-main
+export EMBODIED_PATH=/home/lhj/RLinf-main/examples/embodiment
+export ROBOTWIN_PATH=/home/lhj/RoboTwin-RLinf_support
+export ASSETS_PATH=/home/lhj/RoboTwin-RLinf_support
+export ROBOT_PLATFORM=ALOHA
+export PYTHONPATH=/home/lhj/RLinf-main:/home/lhj/RoboTwin-RLinf_support:/home/lhj/RoboTwin-RLinf_support/robotwin:$PYTHONPATH
+export RLINF_NODE_RANK=0
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export HYDRA_FULL_ERROR=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+ray stop
+ray start --head --port=6379 --disable-usage-stats
+
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /home/lhj/RLinf-main/examples/embodiment/config \
+  --config-name robotwin_beat_block_hammer_grpo_act_conservative
+```
+
+First acceptance check:
+
+- the model prints only `logstd` and `act_model.action_head.*` as trainable
+- the run reaches `Global Step: 2/2`
+- `env/success_once`, `algorithm/advantages_max`,
+  `actor/policy_loss`, `actor/grad_norm`, and `actor/approx_kl` are logged
+- checkpoints are saved under
+  `/home/lhj/results/robotwin_beat_block_hammer_act_conservative_grpo/smoke/checkpoints/`
+
+If smoke is healthy, run a 5-10 step version with `save_interval=1`, then eval
+each checkpoint on 20 trajectories first. Only the best 2-3 checkpoints should
+be promoted to 100-trajectory eval. Final claims should compare matched budgets:
+baseline clean ACT and the chosen conservative checkpoint on the same number of
+RoboTwin eval trajectories.
+
+Current local smoke result on 2026-06-20: the conservative config reached
+`Global Step: 2/2` and saved:
+
+```text
+/home/lhj/results/robotwin_beat_block_hammer_act_conservative_grpo/smoke/checkpoints/global_step_1/actor/model_state_dict/full_weights.pt
+/home/lhj/results/robotwin_beat_block_hammer_act_conservative_grpo/smoke/checkpoints/global_step_2/actor/model_state_dict/full_weights.pt
+```
+
+The printed trainable parameters were exactly:
+
+```text
+[Trainable] logstd
+[Trainable] act_model.action_head.weight
+[Trainable] act_model.action_head.bias
+```
+
+The run produced non-zero dense reward and non-zero GRPO advantages, so the
+conservative update path is active. However, `actor/approx_kl` was still high
+(`10.079` at step 1 and `9.732` at step 2), so the next run should remain short
+and may need an even smaller learning rate before any long training.
+
+## 7. Experiment Ledger and Reproducible Commands
+
+This section is the checkpoint ledger. Every train run and eval run should add
+one row here before we compare numbers. Do not use a checkpoint in a report
+unless its config, base checkpoint, training scope, and eval budget are written
+down here.
+
+### Confirmed Runs
+
+| ID | Artifact | Source config / command | Base ACT checkpoint | Key settings | Result |
+| --- | --- | --- | --- | --- | --- |
+| `act_clean_baseline_100traj_20260620` | no RLinf finetune checkpoint; direct ACT eval | `robotwin_beat_block_hammer_eval_act`, `runner.ckpt_path=null` | `demo_clean-50/policy_last.ckpt` + `dataset_stats.pkl` | eval: `take_action`, `temporal_agg=true`, 5 envs x 20 epochs = 100 trajectories | `eval/success_once=0.60`, `eval/success_at_end=0.60` |
+| `dense_full_grpo_gs10_20260617` | `/home/lhj/results/robotwin_beat_block_hammer_act_dense_lr1e7_ep10/checkpoints/global_step_10/actor/model_state_dict/full_weights.pt` | dense-reward GRPO local run | `demo_clean-50/policy_last.ckpt` + `dataset_stats.pkl` | full ACT trainable, dense reward, lr about `1e-7`, 10 global steps | 100-traj eval: `eval/success_once=0.40`, `eval/success_at_end=0.40` |
+| `conservative_smoke_gs1_20260620` | `/home/lhj/results/robotwin_beat_block_hammer_act_conservative_grpo/smoke/checkpoints/global_step_1/actor/model_state_dict/full_weights.pt` | `robotwin_beat_block_hammer_grpo_act_conservative` | `demo_clean-50/policy_last.ckpt` + `dataset_stats.pkl` | train only `logstd` + `act_model.action_head.*`, `initial_logstd=-3.0`, clamp `[-5,-2]`, `use_orig_params=true`, train envs `2`, group size `2`, lr `1e-7` | train rollout only: `env/success_once=0.0`, `advantages_max=0.707`, `actor/approx_kl=10.079`; eval pending |
+| `conservative_smoke_gs2_20260620` | `/home/lhj/results/robotwin_beat_block_hammer_act_conservative_grpo/smoke/checkpoints/global_step_2/actor/model_state_dict/full_weights.pt` | `robotwin_beat_block_hammer_grpo_act_conservative` | `demo_clean-50/policy_last.ckpt` + `dataset_stats.pkl` | same as `conservative_smoke_gs1_20260620` | train rollout: `env/success_once=0.0`, `advantages_max=0.707`, `actor/approx_kl=9.732`; 20-traj eval: `eval/success_once=0.80`, `eval/success_at_end=0.80` |
+
+### Eval Results
+
+| ID | Checkpoint | Eval settings | Metrics | Interpretation |
+| --- | --- | --- | --- | --- |
+| `conservative_smoke_gs2_eval20_20260620_155240` | `/home/lhj/results/robotwin_beat_block_hammer_act_conservative_grpo/smoke/checkpoints/global_step_2/actor/model_state_dict/full_weights.pt` | `robotwin_beat_block_hammer_eval_act`, `env.eval.total_num_envs=5`, `algorithm.eval_rollout_epoch=4`, `env.eval.use_fixed_reset_state_ids=False`, `runner.logger.experiment_name=eval_gs2_20traj` | `eval/num_trajectories=20`, `eval/success_once=0.80`, `eval/success_at_end=0.80`, `eval/return=0.80`, `eval/reward=0.002`, `eval/episode_len=400` | promising quick eval; still a small sample, so confirm with matched 100-trajectory eval before claiming improvement over the clean ACT 100-traj baseline |
+
+### Historical Checkpoints Not Yet Attributed
+
+These files exist on disk, but their exact command/config should be recovered
+before using them for any conclusion:
+
+```text
+/home/lhj/results/robotwin_beat_block_hammer_act_eval/checkpoints/global_step_1/actor/model_state_dict/full_weights.pt
+/home/lhj/results/robotwin_beat_block_hammer_act_eval/checkpoints/global_step_2/actor/model_state_dict/full_weights.pt
+/home/lhj/results/robotwin_beat_block_hammer_act_eval/checkpoints/global_step_10/actor/model_state_dict/full_weights.pt
+/home/lhj/results/robotwin_beat_block_hammer_act_eval/checkpoints/global_step_20/actor/model_state_dict/full_weights.pt
+/home/lhj/results/robotwin_beat_block_hammer_act_eval/checkpoints/global_step_30/actor/model_state_dict/full_weights.pt
+/home/lhj/results/robotwin_beat_block_hammer_act_eval/checkpoints/global_step_40/actor/model_state_dict/full_weights.pt
+/home/lhj/results/robotwin_beat_block_hammer_act_eval/checkpoints/global_step_50/actor/model_state_dict/full_weights.pt
+```
+
+### Failed / Non-Result Attempts
+
+| Time | Command intent | Outcome | Meaning |
+| --- | --- | --- | --- |
+| 2026-06-20 | eval `conservative_smoke_gs2` from shell prompt `(base)` | `ModuleNotFoundError: No module named 'hydra'` | not a model/eval failure; the command was run outside the `RoboTwin` conda environment |
+| 2026-06-20 | eval `conservative_smoke_gs2` from `RoboTwin` env | `OverrideParseException` on `runner.logger.experiment_name=eval_gs2_20traj~` | not a model/eval failure; the command had an accidental trailing `~` in a Hydra override |
+
+### Complete Eval Setup
+
+Always use this full environment block for RLinf/RoboTwin eval. The important
+part is `source .../conda.sh` plus `conda activate RoboTwin`; running from
+`(base)` will miss Hydra and other RLinf dependencies.
+
+```bash
+source /home/lhj/anaconda3/etc/profile.d/conda.sh
+conda activate RoboTwin
+cd /home/lhj/RLinf-main
+
+export REPO_PATH=/home/lhj/RLinf-main
+export EMBODIED_PATH=/home/lhj/RLinf-main/examples/embodiment
+export ROBOTWIN_PATH=/home/lhj/RoboTwin-RLinf_support
+export ASSETS_PATH=/home/lhj/RoboTwin-RLinf_support
+export ROBOT_PLATFORM=ALOHA
+export PYTHONPATH=/home/lhj/RLinf-main:/home/lhj/RoboTwin-RLinf_support:/home/lhj/RoboTwin-RLinf_support/robotwin:$PYTHONPATH
+export RLINF_NODE_RANK=0
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export HYDRA_FULL_ERROR=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+ray stop
+ray start --head --port=6379 --disable-usage-stats
+```
+
+Quick 20-trajectory eval for `conservative_smoke_gs2`:
+
+```bash
+python /home/lhj/RLinf-main/examples/embodiment/eval_embodied_agent.py \
+  --config-path /home/lhj/RLinf-main/examples/embodiment/config \
+  --config-name robotwin_beat_block_hammer_eval_act \
+  runner.ckpt_path=/home/lhj/results/robotwin_beat_block_hammer_act_conservative_grpo/smoke/checkpoints/global_step_2/actor/model_state_dict/full_weights.pt \
+  env.eval.total_num_envs=5 \
+  algorithm.eval_rollout_epoch=4 \
+  env.eval.use_fixed_reset_state_ids=False \
+  runner.logger.log_path=../results/robotwin_beat_block_hammer_act_conservative_grpo_eval \
+  runner.logger.experiment_name=eval_gs2_20traj
+```
+
+Quick 20-trajectory eval for `conservative_smoke_gs1`:
+
+```bash
+python /home/lhj/RLinf-main/examples/embodiment/eval_embodied_agent.py \
+  --config-path /home/lhj/RLinf-main/examples/embodiment/config \
+  --config-name robotwin_beat_block_hammer_eval_act \
+  runner.ckpt_path=/home/lhj/results/robotwin_beat_block_hammer_act_conservative_grpo/smoke/checkpoints/global_step_1/actor/model_state_dict/full_weights.pt \
+  env.eval.total_num_envs=5 \
+  algorithm.eval_rollout_epoch=4 \
+  env.eval.use_fixed_reset_state_ids=False \
+  runner.logger.log_path=../results/robotwin_beat_block_hammer_act_conservative_grpo_eval \
+  runner.logger.experiment_name=eval_gs1_20traj
+```
+
+Matched 100-trajectory eval for the clean ACT baseline:
+
+```bash
+python /home/lhj/RLinf-main/examples/embodiment/eval_embodied_agent.py \
+  --config-path /home/lhj/RLinf-main/examples/embodiment/config \
+  --config-name robotwin_beat_block_hammer_eval_act \
+  runner.ckpt_path=null \
+  env.eval.total_num_envs=5 \
+  algorithm.eval_rollout_epoch=20 \
+  env.eval.use_fixed_reset_state_ids=False \
+  runner.logger.log_path=../results/robotwin_beat_block_hammer_act_baseline_eval \
+  runner.logger.experiment_name=clean_act_100traj
+```
+
+Matched 100-trajectory eval for `conservative_smoke_gs2`:
+
+```bash
+python /home/lhj/RLinf-main/examples/embodiment/eval_embodied_agent.py \
+  --config-path /home/lhj/RLinf-main/examples/embodiment/config \
+  --config-name robotwin_beat_block_hammer_eval_act \
+  runner.ckpt_path=/home/lhj/results/robotwin_beat_block_hammer_act_conservative_grpo/smoke/checkpoints/global_step_2/actor/model_state_dict/full_weights.pt \
+  env.eval.total_num_envs=5 \
+  algorithm.eval_rollout_epoch=20 \
+  env.eval.use_fixed_reset_state_ids=False \
+  runner.logger.log_path=../results/robotwin_beat_block_hammer_act_conservative_grpo_eval \
+  runner.logger.experiment_name=eval_gs2_100traj
+```
+
+When any eval finishes, append the printed metrics here with:
+
+- command
+- checkpoint path
+- `env.eval.total_num_envs`
+- `algorithm.eval_rollout_epoch`
+- `eval/num_trajectories`
+- `eval/success_once`
+- `eval/success_at_end`
+- `eval/return`
+- event file or `metrics.log` path if available

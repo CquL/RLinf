@@ -1,0 +1,48 @@
+# Conservative GRPO fine-tuning for RoboTwin beat_block_hammer with ACT.
+#
+# This config keeps the clean ACT checkpoint as the initialization, freezes the
+# ACT body, and lets GRPO update only the final action head plus logstd.
+
+defaults:
+  - robotwin_beat_block_hammer_eval_act
+  - _self_
+
+runner:
+  only_eval: False
+  max_epochs: 2
+  val_check_interval: -1
+  save_interval: 1
+  ckpt_path: null
+  logger:
+    log_path: "../results/robotwin_beat_block_hammer_act_conservative_grpo"
+    experiment_name: "smoke"
+
+algorithm:
+  group_size: 2
+
+env:
+  train:
+    total_num_envs: 2
+    group_size: 2
+    check_group_reset_state_ids: True
+    video_cfg:
+      save_video: False
+  eval:
+    total_num_envs: 1
+
+actor:
+  micro_batch_size: 1
+  global_batch_size: 2
+  enable_offload: True
+  fsdp_config:
+    use_orig_params: True
+  model:
+    trainable_scope: "action_head_logstd"
+    initial_logstd: -3.0
+    min_logstd: -5.0
+    max_logstd: -2.0
+  optim:
+    lr: 1.0e-7
+
+rollout:
+  enable_offload: True

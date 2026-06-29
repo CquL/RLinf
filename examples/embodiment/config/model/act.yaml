@@ -40,3 +40,9 @@ initial_logstd: -2.0
 min_logstd: -5.0
 max_logstd: 1.0
 use_stochastic_eval: false
+
+# Which ACT parameters are trainable during RL fine-tuning.
+# - all: keep the original behavior and update the full ACT policy plus logstd.
+# - action_head_logstd: freeze ACT and update only act_model.action_head + logstd.
+# - logstd: update only the exploration std parameter.
+trainable_scope: "all"

@@ -168,6 +168,7 @@ class ACTRLPolicy(nn.Module, BasePolicy):
         # 限制 logstd 的取值范围，防止 std 过大（噪声太大）或过小（失去探索能力）
         self.min_logstd = float(cfg.get("min_logstd", -5.0))          # 最小 logstd，对应 std ≈ 0.0067
         self.max_logstd = float(cfg.get("max_logstd", 1.0))           # 最大 logstd，对应 std ≈ 2.72
+        self.trainable_scope = str(cfg.get("trainable_scope", "all")).lower()
 
         # ---- 图像归一化参数 ----
         # image_normalization: "imagenet" = 用 ImageNet 的 mean/std 归一化
@@ -198,6 +199,7 @@ class ACTRLPolicy(nn.Module, BasePolicy):
             "image_std",
             torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
         )
+        self._configure_trainable_parameters(cfg)
 
     # =========================================================================
     # _build_act_args — 构建 ACT 模型的配置参数
@@ -231,6 +233,55 @@ class ACTRLPolicy(nn.Module, BasePolicy):
             action_dim=self.action_dim,
             state_dim=self.state_dim,
         )
+
+    def _configure_trainable_parameters(self, cfg) -> None:
+        """Apply optional conservative trainable-scope settings."""
+        custom_patterns = cfg.get("trainable_parameter_patterns", None)
+
+        if custom_patterns is not None:
+            if isinstance(custom_patterns, str):
+                trainable_patterns = (custom_patterns,)
+            else:
+                trainable_patterns = tuple(str(pattern) for pattern in custom_patterns)
+        elif self.trainable_scope in {"all", "full"}:
+            trainable_patterns = None
+        elif self.trainable_scope in {"action_head_logstd", "head_logstd"}:
+            trainable_patterns = ("logstd", "act_model.action_head")
+        elif self.trainable_scope == "logstd":
+            trainable_patterns = ("logstd",)
+        else:
+            raise ValueError(
+                "Unsupported ACT trainable_scope "
+                f"{self.trainable_scope!r}. Supported values: all, "
+                "action_head_logstd, logstd."
+            )
+
+        if trainable_patterns is not None:
+            for _, param in self.named_parameters():
+                param.requires_grad = False
+            for name, param in self.named_parameters():
+                if any(
+                    name == pattern
+                    or name.startswith(f"{pattern}.")
+                    or pattern in name
+                    for pattern in trainable_patterns
+                ):
+                    param.requires_grad = True
+
+        trainable = [
+            (name, param.numel())
+            for name, param in self.named_parameters()
+            if param.requires_grad
+        ]
+        total_params = sum(param.numel() for param in self.parameters())
+        trainable_params = sum(numel for _, numel in trainable)
+        print(
+            f"ACT trainable_scope={self.trainable_scope}: "
+            f"{trainable_params}/{total_params} trainable parameters"
+        )
+        if trainable_patterns is not None:
+            for name, _ in trainable:
+                print(f"[Trainable] {name}")
 
     # =========================================================================
     # _load_checkpoint — 加载 ACT 预训练权重
